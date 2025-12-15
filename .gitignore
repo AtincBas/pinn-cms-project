@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environment
+.venv/
+
+# Data / large files
+data/
+*.csv
+*.parquet
+
+# Models / weights
+*.pt
+*.pth
+*.ckpt
+*.h5
+
+# Logs
+*.log
+
+# OS / Editor
+.DS_Store
+.vscode/
+
+# Secrets
+.env
