@@ -68,7 +68,7 @@ parquet_path = "TTbar_PU50_pixelTracksDoublets_0_final.parquet"
 # Tüm veriyi parquetten oku
 data_full = pd.read_parquet(parquet_path)
 print("Parquet veri shape:", data_full.shape)
-data_full["s"] = 0.0
+
 
 """## 2. Feature ve Target
 Giriş: in/out koordinatlar ve PU
@@ -76,14 +76,17 @@ Giriş: in/out koordinatlar ve PU
 """
 
 feature_cols = [
-    "inX", "inY", "inZ",          # 0,1,2
-    "outX", "outY", "outZ",       # 3,4,5
-    "PU",                         # 6
-    "bSX", "bSY", "bSZ",          # 7,8,9
-    "BunchCrossing",              # 10                   # 11  (Labels kısmından alıp feature'a ekliyoruz)
-    "s",                          # 12  (0-1 arası parametre)
+    "inX", "inY", "inZ",
+    "outX", "outY", "outZ",
+    "PU",
+    "BunchCrossing",
+    "inTpCharge",
+    "inTpPt",     # <-- A: eklendi
+    "inR",
+    "outR"
 ]
 
+fixed_bz = 3.8112  # CMS Solenoid Field (Tesla) - Varsayılan değer
 target_cols = ["outTpPhi", "outTpEta"]
 
 # Kontrol
@@ -102,41 +105,12 @@ else:
 
 print("Kullanılan veri shape:", data_sample.shape)
 
-#X_data = data_sample[feature_cols].to_numpy(dtype=np.float32)
-#y_data = data_sample[target_cols].to_numpy(dtype=np.float32)
+print("Toplam kolon sayısı:", len(data_full.columns))
+for i, col in enumerate(data_full.columns):
+    print(f"{i:03d} | {col}")
 
-# @title
-"""
-store = pd.HDFStore("TTbar_PU50_pixelTracksDoublets_0_final.h5", mode="r")
-print(store.keys())
-store.close()
-"""
-
-# @title
-"""
-file_path = "TTbar_PU50_pixelTracksDoublets_0_final.h5"
-data_sample1 = pd.read_hdf(file_path, start=0, stop=500000)
-print(data_sample1.shape)
-"""
-
-# @title
-"""
-file_path = "TTbar_PU50_pixelTracksDoublets_0_final.h5"
-data_sample2 = pd.read_hdf(file_path, start=500000, stop=900000)
-print(data_sample2.shape)
-"""
-
-# @title
-"""
-file_path = "TTbar_PU50_pixelTracksDoublets_0_final.h5"
-data_sample3 = pd.read_hdf(file_path, start=900000, stop=1300000)
-print(data_sample3.shape)
-"""
-
-# @title
-"""
-data_sample = pd.concat([data_sample1, data_sample2, data_sample3], ignore_index=True)
-"""
+print("inTpCharge unique:", data_sample["inTpCharge"].value_counts(dropna=False).head(10))
+print("outTpCharge unique:", data_sample["outTpCharge"].value_counts(dropna=False).head(10))
 
 """## 2. Feature ve Target
 Giriş: in/out koordinatlar ve PU    
@@ -144,31 +118,22 @@ Giriş: in/out koordinatlar ve PU
 
 """
 
-# @title
-"""
-feature_cols = [
-    "inX", "inY", "inZ",
-    "outX", "outY", "outZ",
-    "PU", "bSX", "bSY", "bSZ",
-]
-
-target_cols = ["outTpPhi", "outTpEta"]
-
-# kontrol
-print([ (c, c in data_sample.columns) for c in feature_cols ])
-print([ (c, c in data_sample.columns) for c in target_cols ])
-"""
-
 X_data = data_sample[feature_cols].to_numpy(dtype=np.float32)
 y_data = data_sample[target_cols].to_numpy(dtype=np.float32)
 
 x_mean = X_data.mean(axis=0, keepdims=True)
 x_std  = X_data.std(axis=0, keepdims=True) + 1e-6
+
+idx_inR  = feature_cols.index("inR")
+idx_outR = feature_cols.index("outR")
+
+
 X_norm = (X_data - x_mean) / x_std
 
 y_mean = y_data.mean(axis=0, keepdims=True)
 y_std  = y_data.std(axis=0, keepdims=True) + 1e-6
 y_norm = (y_data - y_mean) / y_std
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -250,23 +215,21 @@ def wrap_torch(dphi):
     return (dphi + math.pi) % (2*math.pi) - math.pi
 
 class InversePINN(nn.Module):
-    def __init__(self, in_dim, coord_index):
+    def __init__(self, in_dim, charge_index, ptref_index):
         super().__init__()
-        self.coord_index = coord_index
+        self.charge_index = charge_index
+        self.ptref_index  = ptref_index
+
         self.net = FCNN(in_dim, out_dim=6)
-        self.Bz = nn.Parameter(torch.tensor(3.8, dtype=torch.float32))
+
+        # Ölçek sabiti (birim/param belirsizliği)
+        self.kappa = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
     def forward(self, x):
         return self.net(x)
 
-    def pde_residual(self, x, y_mean, y_std, eps=1e-12):
-        """
-        Helis-lokal kısıtlar (collocation ile anlamlı):
-          - d²phi/ds² ≈ 0
-          - deta/ds   ≈ 0
-
-        phi,eta: ağın px,py,pz çıktısından türetilir.
-        """
+    """
+    def pde_residual(self, x, eps=1e-12):
         x = x.clone().requires_grad_(True)
 
         u = self.forward(x)  # [N,6]
@@ -274,37 +237,134 @@ class InversePINN(nn.Module):
         Py = u[:, 4]
         Pz = u[:, 5]
 
-        # phi, eta from momentum
-        pt  = torch.sqrt(Px**2 + Py**2 + eps)
+        # modelden phi/eta
         phi = torch.atan2(Py, Px)
-        eta = torch.asinh(Pz / (pt + eps))   # çok daha stabil
+
+        # ---------- input truth charge (unnormalize) ----------
+        q_norm = x[:, self.charge_index]
+        q = q_norm * x_std_t[self.charge_index] + x_mean_t[self.charge_index]
+
+        # ---------- input truth pT (unnormalize) ----------
+        ptref_norm = x[:, self.ptref_index]
+        pt_ref = ptref_norm * x_std_t[self.ptref_index] + x_mean_t[self.ptref_index]
+        pt_ref = torch.clamp(pt_ref.abs(), min=1e-2)  # güvenlik
+
+        # ---------- input Bz from bSZ (unnormalize) ----------
+        bz_norm = x[:, self.bSZ_index]
+        Bz = bz_norm * x_std_t[self.bSZ_index] + x_mean_t[self.bSZ_index]
+
+        omega = self.kappa * q * Bz / (pt_ref + eps)
+
+        # sin/cos ile stabilize
+        c = torch.cos(phi).unsqueeze(1)
+        s = torch.sin(phi).unsqueeze(1)
+
+        grad_c = torch.autograd.grad(c, x, torch.ones_like(c), create_graph=True, retain_graph=True)[0]
+        grad_s = torch.autograd.grad(s, x, torch.ones_like(s), create_graph=True, retain_graph=True)[0]
+        omega_ = omega.unsqueeze(1)
+
+        r1 = dc_ds + s * omega_
+        r2 = ds_ds - c * omega_
+
+        # eta sabitliği için eski r3'ü korumak istersen:
+        # pt_model = torch.sqrt(Px**2 + Py**2 + eps)
+        # eta = torch.asinh(Pz / (pt_model + eps))
+        # eta_ = eta.unsqueeze(1)
+        # grad_eta = torch.autograd.grad(eta_, x, torch.ones_like(eta_), create_graph=True, retain_graph=True)[0]
+        # deta_ds = grad_eta[:, self.coord_index:self.coord_index+1]
+        # r3 = deta_ds
+        # return torch.cat([r1, r2, r3], dim=1), q
+
+        return torch.cat([r1, r2], dim=1), q   # [N,2], q
+        """
 
 
-        # normalize (optional but stabilizes scales)
-        phi_n = (phi - y_mean[0]) / y_std[0]
-        eta_n = (eta - y_mean[1]) / y_std[1]
+    def pde_residual_total(self, xb_norm, fixed_bz=3.81, eps=1e-12):
+        """
+        Toplam türev: tau leaf değişkeni ile x(tau) kurulur ve autograd ile d/dtau alınır.
+        R-parametrizasyon: R(tau) = inR + tau*(outR-inR)
+        PDE: d/dR sin/cos sistemi -> tau'ya ölçeklenmiş residual
+        """
+        # 1) unnormalize base batch
+        xb0 = xb_norm * x_std_t + x_mean_t   # [N, in_dim]
+        N = xb0.size(0)
 
-        phi_n = phi_n.unsqueeze(1)  # [N,1]
-        eta_n = eta_n.unsqueeze(1)  # [N,1]
+        # 2) leaf tau in (0,1)
+        tau = torch.rand((N,), device=xb0.device, dtype=xb0.dtype, requires_grad=True)  # [N]
 
-        # dphi/ds, deta/ds
-        grad_phi = torch.autograd.grad(phi_n, x, torch.ones_like(phi_n),
-                                       create_graph=True, retain_graph=True)[0]
-        dphi_ds = grad_phi[:, self.coord_index:self.coord_index+1]
+        # 3) segment endpoints (base)
+        inX  = xb0[:, idx_inX];  inY  = xb0[:, idx_inY];  inZ  = xb0[:, idx_inZ]
+        outX0 = xb0[:, idx_outX]; outY0 = xb0[:, idx_outY]; outZ0 = xb0[:, idx_outZ]
 
-        grad_eta = torch.autograd.grad(eta_n, x, torch.ones_like(eta_n),
-                                       create_graph=True, retain_graph=True)[0]
-        deta_ds = grad_eta[:, self.coord_index:self.coord_index+1]
+        dx = outX0 - inX
+        dy = outY0 - inY
+        dz = outZ0 - inZ
 
-        # d²phi/ds²
-        grad_dphi = torch.autograd.grad(dphi_ds, x, torch.ones_like(dphi_ds),
-                                        create_graph=True, retain_graph=True)[0]
-        d2phi_ds2 = grad_dphi[:, self.coord_index:self.coord_index+1]
+        # 4) interpolate current point along the segment (tau)
+        outX = inX + tau * dx
+        outY = inY + tau * dy
+        outZ = inZ + tau * dz
 
-        r_phi = d2phi_ds2
-        r_eta = deta_ds
+        # 5) R(tau) using inR/outR
+        inR  = xb0[:, idx_inR]
+        outR0 = xb0[:, idx_outR]
 
-        return torch.cat([r_phi, r_eta], dim=1)  # [N,2]
+        # --- EKSİK PARÇA 1: dR HESABI ---
+        # Zincir kuralı için R farkına ihtiyacımız var (dR/dtau = outR - inR)
+        diff_R = outR0 - inR
+
+        R = inR + tau * diff_R
+
+        # 6) build xb(tau) (still in physical units), keep other features same
+        xb = xb0.clone()
+        xb[:, idx_outX] = outX
+        xb[:, idx_outY] = outY
+        xb[:, idx_outZ] = outZ
+        # Also write R into outR (optional, but consistent)
+        xb[:, idx_outR] = R
+
+        # 7) normalize and forward
+        x = (xb - x_mean_t) / x_std_t
+        u = self.forward(x)  # [N,6]
+        Px = u[:, 3]; Py = u[:, 4]; Pz = u[:, 5]
+
+        phi = torch.atan2(Py, Px)
+        c = torch.cos(phi)  # [N]
+        s = torch.sin(phi)  # [N]
+
+        # 8) Unnormalize q, pt_ref
+        q_norm = x[:, self.charge_index]
+        q = q_norm * x_std_t[self.charge_index] + x_mean_t[self.charge_index]
+
+        ptref_norm = x[:, self.ptref_index]
+        pt_ref = ptref_norm * x_std_t[self.ptref_index] + x_mean_t[self.ptref_index]
+        pt_ref = torch.clamp(pt_ref.abs(), min=1e-2)
+
+        # 9) Omega hesabı ve Bz
+        # DÜZELTME: fixed_bz argüman olarak eklendi (varsayılan 3.81 Tesla)
+        Bz = fixed_bz
+
+        # omega_R: Radyal mesafeye göre değişim hızı (dPhi / dR)
+        omega_R = self.kappa * q * Bz / (pt_ref + eps)
+
+        # --- EKSİK PARÇA 2: Zincir Kuralı (Chain Rule) ---
+        # dPhi/dtau = (dPhi/dR) * (dR/dtau)
+        # dR/dtau = diff_R (yani outR - inR)
+        omega_tau = diff_R * omega_R
+
+        # 10) total derivatives wrt tau
+        dc_dtau = torch.autograd.grad(c, tau, grad_outputs=torch.ones_like(c),
+                                      create_graph=True, retain_graph=True)[0]  # [N]
+        ds_dtau = torch.autograd.grad(s, tau, grad_outputs=torch.ones_like(s),
+                                      create_graph=True, retain_graph=True)[0]  # [N]
+
+        # 11) residuals (tau form)
+        # Artık omega_tau tanımlı olduğu için burası çalışır
+        r1 = dc_dtau + s * omega_tau
+        r2 = ds_dtau - c * omega_tau
+
+        res = torch.stack([r1, r2], dim=1)  # [N,2]
+        return res, q
 
 # x_mean, x_std numpy -> torch tensor (device üzerinde)
 x_mean_t = torch.tensor(x_mean.squeeze(0), dtype=torch.float32, device=device)
@@ -319,6 +379,7 @@ idx_inZ  = feature_cols.index("inZ")
 idx_outX = feature_cols.index("outX")
 idx_outY = feature_cols.index("outY")
 idx_outZ = feature_cols.index("outZ")
+
 
 def geometry_phi_eta_from_xnorm(xb_norm, eps=1e-12):
     """
@@ -341,27 +402,6 @@ def phi_angle_mse(phi_pred, phi_tgt):
     d = wrap_torch(phi_pred - phi_tgt)
     return (d*d).mean()
 
-def make_collocation_from_batch(xb, coord_index, n_f=None):
-    """
-    xb: [N,in_dim] normalized batch
-    n_f: None -> N kadar; istersen 2N gibi artırabilirsin
-    """
-    N = xb.size(0)
-    if n_f is None:
-        n_f = N
-
-    # random seçilecek örnekler
-    if n_f == N:
-        x_f = xb.clone()
-    else:
-        idx = torch.randint(0, N, (n_f,), device=xb.device)
-        x_f = xb[idx].clone()
-
-    # s'yi [0,1] uniform yap
-    s_rand = torch.rand((n_f,), device=xb.device)
-    x_f[:, coord_index] = s_rand
-    return x_f
-
 # =========================
 # Animasyon için sabit alt-küme (ör: test setten 2000 örnek)
 # =========================
@@ -377,6 +417,11 @@ snapshots_pinn = []  # her eleman: (epoch, y_pred_anim)
 snapshots_pure = []
 SNAP_EVERY = 5       # her 5 epoch'ta bir kare
 
+xb = X_train[:2048]
+xb_phys = xb * x_std_t + x_mean_t
+dR = xb_phys[:, idx_outR] - xb_phys[:, idx_inR]
+print("dR min/mean/max:", dR.min().item(), dR.mean().item(), dR.max().item())
+
 """## 4. PINN Eğitimi
 Veri + PDE kaybı birlikte minimize edilir.
 
@@ -385,18 +430,26 @@ Veri + PDE kaybı birlikte minimize edilir.
 """## 4. PINN Eğitimi
 Veri + PDE kaybı birlikte minimize edilir (train + val + adaptive λ_pde).
 """
+DEBUG_PDE = False
+DEBUG_ONCE = {"done": False}
 
 pde_ema = None
 in_dim = X_tensor.shape[1]
 out_dim = y_tensor.shape[1]   # PureNN için
 
 
-coord_index = feature_cols.index("s")
-model = InversePINN(in_dim, coord_index).to(device)
+charge_index  = feature_cols.index("inTpCharge")
+ptref_index   = feature_cols.index("inTpPt")   # <-- A
+
+
+
+model = InversePINN(in_dim, charge_index, ptref_index).to(device)
+
+
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 mse_loss  = nn.MSELoss()
 
-NUM_EPOCHS_PINN = 200
+NUM_EPOCHS_PINN = 100
 
 history_pinn = {
     "epoch": [],
@@ -439,16 +492,100 @@ def pinn_loss(xb, yb):
     y_pred_norm = torch.stack([phi_norm, eta_norm], dim=1)  # [N,2]
 
     # ---- 4) data loss ----
-    loss_data = mse_loss(y_pred_norm, yb)
+    phi_true = yb[:,0] * y_std_t[0] + y_mean_t[0]
+    eta_true = yb[:,1] * y_std_t[1] + y_mean_t[1]
+
+    loss_phi = phi_angle_mse(phi_pred, phi_true)
+    loss_eta = torch.mean((eta_pred - eta_true)**2)
+
+    loss_data = loss_phi + loss_eta
+
 
     # ---- 5) geometry-consistency loss (unnormalized angles) ----
     phi_dir, eta_dir = geometry_phi_eta_from_xnorm(xb, eps=eps)
     loss_geo = phi_angle_mse(phi_pred, phi_dir) + torch.mean((eta_pred - eta_dir)**2)
 
-    # ---- 6) PDE loss via collocation ----
-    x_f = make_collocation_from_batch(xb, coord_index=coord_index, n_f=None)
-    res = model.pde_residual(x_f, y_mean=y_mean_t, y_std=y_std_t, eps=eps)  # [N,2]
-    loss_pde = torch.mean(res**2)
+        # ---- 6) PDE loss via collocation (TOTAL DERIVATIVE) ----
+    res, q = model.pde_residual_total(xb, eps=eps)  # res: [N,2], q: [N]
+
+    # --- unnormalize needed inputs from *this batch* xb ---
+    xb_phys = xb * x_std_t + x_mean_t
+
+    pt_ref = xb_phys[:, ptref_index]                 # [N] physical
+    Bz     = 3.81                   # [N] physical
+    dR     = xb_phys[:, idx_outR] - xb_phys[:, idx_inR]  # [N] physical
+
+    # --- masks ---
+    mask_q  = (q.abs() >= 0.5)
+    mask_pt = (pt_ref > 0.0)   # sentinel/invalid pt_ref dışarı
+    mask = mask_q & mask_pt
+    mask_frac = mask.float().mean()
+
+    # --- omega in R-domain, then tau-domain scaling ---
+    pt_ref_c = torch.clamp(pt_ref.abs(), min=1e-2)
+    omega_R  = model.kappa * q * Bz / (pt_ref_c + eps)   # [N]
+    omega_tau = dR * omega_R                              # [N]
+
+    # --- scale residual by typical omega_tau magnitude ---
+    omega_scale = torch.sqrt((omega_tau**2).mean()).detach() + 1e-3
+    res_scaled = res / omega_scale
+
+    # --- masked PDE loss ---
+    if mask.any():
+        loss_pde = torch.mean(res_scaled[mask] ** 2)
+    else:
+        loss_pde = torch.tensor(0.0, device=xb.device)
+
+
+    # ---------------- DEBUG PRINTS (once) ----------------
+    if DEBUG_PDE and (not DEBUG_ONCE["done"]):
+        with torch.no_grad():
+            print("\n=== DEBUG PDE (one batch) ===")
+            print("mask_frac:", float(mask_frac.item()),
+                  "| N_mask:", int(mask.sum().item()),
+                  "/", int(mask.numel()))
+            print("mask_q only frac:", float(mask_q.float().mean().item()),
+                  "| mask_pt only frac:", float(mask_pt.float().mean().item()))
+
+            qv = q.detach().cpu()
+            print("q unique approx:", {v: int((qv==v).sum()) for v in [-1.0, 0.0, 1.0]})
+
+            print("pt_ref min/mean/max:",
+                  float(pt_ref.min().item()),
+                  float(pt_ref.mean().item()),
+                  float(pt_ref.max().item()))
+
+            print("Bz (bSZ) min/mean/max:",
+                  float(Bz.min().item()),
+                  float(Bz.mean().item()),
+                  float(Bz.max().item()))
+
+            print("omega_R abs mean/max:",
+                  float(omega_R.abs().mean().item()),
+                  float(omega_R.abs().max().item()))
+            print("omega_tau abs mean/max:",
+                  float(omega_tau.abs().mean().item()),
+                  float(omega_tau.abs().max().item()))
+
+
+            if mask.any():
+                rm = res[mask]
+                rsm = res_scaled[mask]
+                print("res abs mean/max (masked raw):",
+                      float(rm.abs().mean().item()),
+                      float(rm.abs().max().item()))
+                print("res abs mean/max (masked scaled):",
+                      float(rsm.abs().mean().item()),
+                      float(rsm.abs().max().item()))
+
+            print("loss_pde (scaled, masked):", float(loss_pde.item()))
+            print("kappa:", float(model.kappa.detach().item()))
+        DEBUG_ONCE["done"] = True
+    # ----------------------------------------------------
+
+
+
+
 
     # ---- 6b) PDE loss normalization (EMA) ----
     global pde_ema
@@ -459,9 +596,24 @@ def pinn_loss(xb, yb):
     loss_pde_norm = loss_pde / (pde_ema + 1e-8)
 
 
+
+
     # ---- 7) total ----
-    loss_total = loss_data + lambda_geo * loss_geo + lambda_pde * loss_pde_norm
-    return loss_total, loss_data.detach().item(), loss_geo.detach().item(), loss_pde.detach().item()
+    # Epoch döngüsü içinde:
+    # İlk 20 epoch sadece veriye (MSE) odaklansın, fizik kaybını sıfırla.
+    if epoch < 20:
+        actual_lambda_pde = 0.0
+    else:
+        actual_lambda_pde = lambda_pde # Adaptive değer
+
+    loss_total = loss_data + lambda_geo * loss_geo + actual_lambda_pde * loss_pde_norm
+    return (
+        loss_total,
+        loss_data.detach().item(),
+        loss_geo.detach().item(),
+        loss_pde_norm.detach().item(),   # <-- artık log’da "pde" total’daki ölçekle aynı
+    )
+
 
 
 
@@ -498,10 +650,14 @@ for epoch in range(1, NUM_EPOCHS_PINN + 1):
     avg_train_geo  = total_geo  / len(train_dataset_pinn)
     avg_train_pde  = total_pde  / len(train_dataset_pinn)
 
-    # --- adaptive lambda_pde: data ile pde aynı mertebeye gelsin ---
-    lambda_pde_target = lambda_pde  # (sen ratio ile hesaplıyorsan onu target yap)
-    lambda_pde = 0.9 * lambda_pde + 0.1 * lambda_pde_target
-    lambda_pde = float(np.clip(lambda_pde, 0.0, 5.0))
+    # --- adaptive lambda_pde ---
+    with torch.no_grad():
+        # avg_train_data ve avg_train_pde ham değerler, ama biz loss_pde_norm ölçeğini istiyoruz.
+        # pratik yaklaşım: epoch içindeki ortalama ham pde'yi pde_ema ile normalize et:
+        lambda_pde_target = avg_train_data / (avg_train_pde + 1e-8)
+        lambda_pde = 0.9 * lambda_pde + 0.1 * lambda_pde_target
+        lambda_pde = float(np.clip(lambda_pde, 0.0, 20.0))
+
 
 
     # ---------- VALIDATION ----------
@@ -551,7 +707,7 @@ for epoch in range(1, NUM_EPOCHS_PINN + 1):
     history_pinn["lambda_geo"].append(lambda_geo)
 
 
-    if epoch % 10 == 0 or epoch == 1:
+    if epoch % 5 == 0 or epoch == 1:
         print(
             f"Epoch {epoch:03d} | "
             f"Train L={avg_train_loss:.3e} (data={avg_train_data:.3e}, geo={avg_train_geo:.3e}, pde={avg_train_pde:.3e}) | "
@@ -579,7 +735,7 @@ class PureNN(nn.Module):
 pure_model = PureNN(in_dim, out_dim).to(device)
 optimizer_pure = optim.Adam(pure_model.parameters(), lr=1e-3)
 
-NUM_EPOCHS_PURE = 200
+NUM_EPOCHS_PURE = 100
 
 history_pure = {
     "epoch": [],
@@ -638,6 +794,47 @@ for epoch in range(1, NUM_EPOCHS_PURE + 1):
             f"Val L={avg_val_loss:.3e}"
         )
 
+def check_feature_scales(X_norm, feature_cols, tol_mean=1e-2):
+    print("=== FEATURE SCALE CHECK ===")
+    for i, name in enumerate(feature_cols):
+        col = X_norm[:, i]
+        mean = col.mean().item()
+        std  = col.std().item()
+        print(f"{name:15s} | mean={mean:+.3e} | std={std:.3e}")
+        if abs(mean) > tol_mean:
+            print(f"  ⚠️ Mean not ~0 for {name}")
+        if std < 1e-3:
+            print(f"  ⚠️ Std very small for {name}")
+
+check_feature_scales(X_tensor, feature_cols)
+
+@torch.no_grad()
+def check_pde_inputs(model, xb):
+    u = model(xb)
+    Px, Py, Pz = u[:,3], u[:,4], u[:,5]
+    pt = torch.sqrt(Px**2 + Py**2 + 1e-12)
+
+    print("=== PDE INPUT CHECK ===")
+    print("Px:", Px.min().item(), Px.max().item())
+    print("Py:", Py.min().item(), Py.max().item())
+    print("Pz:", Pz.min().item(), Pz.max().item())
+    print("pT:", pt.min().item(), pt.mean().item(), pt.max().item())
+
+# train başlamadan önce:
+check_pde_inputs(model, X_train[:2048])
+
+def check_pde_residual(model, xb):
+    model.eval()  # eval olur, sorun değil
+
+    # PDE residual (autograd lazım!)
+    res, q = model.pde_residual_total(xb)
+
+    print("=== PDE RESIDUAL CHECK ===")
+    print("res shape:", tuple(res.shape))
+    print("q unique approx:", {v: int((q.detach().cpu()==v).sum()) for v in [-1.0, 0.0, 1.0]})
+    print("mean:", res.abs().mean().item())
+    print("max :", res.abs().max().item())
+
 plt.figure(figsize=(8,5))
 
 # PINN train & val
@@ -657,14 +854,44 @@ plt.legend(frameon=False)
 plt.show()
 
 plt.figure(figsize=(8,5))
-plt.plot(history_pinn["epoch"], history_pinn["train_data_loss"], label="PINN train data loss")
-plt.plot(history_pinn["epoch"], history_pinn["train_pde_loss"],  label="PINN train PDE loss")
+plt.plot(history_pinn["epoch"], history_pinn["train_data"], label="PINN train data")
+plt.plot(history_pinn["epoch"], history_pinn["train_pde"],  label="PINN train pde")
+plt.plot(history_pinn["epoch"], history_pinn["train_geo"],  label="PINN train geo")
 plt.yscale("log")
 plt.xlabel("Epoch")
 plt.ylabel("Loss")
-plt.title("PINN – Data vs PDE loss (train)")
-plt.grid(True, which="both", ls=":")
-plt.legend(frameon=False)
+plt.legend()
+plt.grid(True, which="both", ls="--", alpha=0.4)
+plt.show()
+
+plt.figure(figsize=(8,5))
+plt.plot(history_pinn["epoch"], history_pinn["val_data"], label="PINN val data")
+plt.plot(history_pinn["epoch"], history_pinn["val_pde"],  label="PINN val pde")
+plt.plot(history_pinn["epoch"], history_pinn["val_geo"],  label="PINN val geo")
+plt.yscale("log")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid(True, which="both", ls="--", alpha=0.4)
+plt.show()
+
+plt.figure(figsize=(8,4))
+plt.plot(history_pinn["epoch"], history_pinn["lambda_pde"], label="lambda_pde")
+plt.yscale("log")
+plt.xlabel("Epoch")
+plt.ylabel("lambda_pde")
+plt.grid(True, which="both", ls="--", alpha=0.4)
+plt.legend()
+plt.show()
+
+plt.figure(figsize=(8,5))
+plt.plot(history_pinn["epoch"], history_pinn["train_loss"], label="Train total")
+plt.plot(history_pinn["epoch"], history_pinn["val_loss"],   label="Val total")
+plt.yscale("log")
+plt.xlabel("Epoch")
+plt.ylabel("Total Loss")
+plt.legend()
+plt.grid(True, which="both", ls="--", alpha=0.4)
 plt.show()
 
 plt.figure(figsize=(8,5))
@@ -1279,30 +1506,20 @@ plot_error_hist_phi_eta(
     y_true_test[:,1], y_pred_pinn[:,1], y_pred_pure[:,1],
 )
 
-import pandas as pd
-import numpy as np
-
-# 1) PINN tarihçesini DataFrame'e çevir
-pinn_hist_df = pd.DataFrame({
+hist_df = pd.DataFrame({
     "epoch":        history_pinn["epoch"],
     "train_loss":   history_pinn["train_loss"],
     "val_loss":     history_pinn["val_loss"],
-    "train_data":   history_pinn["train_data_loss"],
-    "train_pde":    history_pinn["train_pde_loss"],
-    "val_data":     history_pinn["val_data_loss"],
-    "val_pde":      history_pinn["val_pde_loss"],
+    "train_data":   history_pinn["train_data"],
+    "train_geo":    history_pinn["train_geo"],
+    "train_pde":    history_pinn["train_pde"],
+    "val_data":     history_pinn["val_data"],
+    "val_geo":      history_pinn["val_geo"],
+    "val_pde":      history_pinn["val_pde"],
     "lambda_pde":   history_pinn["lambda_pde"],
+    "lambda_geo":   history_pinn["lambda_geo"],
 })
-
-# Tam tabloyu görmek istersen (çok uzun olabilir):
-# print(pinn_hist_df.to_string(index=False))
-
-# Benim yorumlayabilmem için genelde SON 10 epoch yeterli:
-print("=== PINN history (last 10 epochs) ===")
-print(pinn_hist_df.tail(10).to_string(index=False))
-
-# İstersen CSV olarak da kaydedebilirsin:
-# pinn_hist_df.to_csv("pinn_history.csv", index=False)
+hist_df.head()
 
 pure_hist_df = pd.DataFrame({
     "epoch":      history_pure["epoch"],
@@ -1715,3 +1932,4 @@ plt.axis("equal")
 plt.grid(True)
 plt.tight_layout()
 plt.show()
+
