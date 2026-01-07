@@ -220,7 +220,7 @@ class InversePINN(nn.Module):
         self.charge_index = charge_index
         self.ptref_index  = ptref_index
 
-        self.net = FCNN(in_dim, out_dim=6)
+        self.net = FCNN(in_dim, out_dim=2)
 
         # Ölçek sabiti (birim/param belirsizliği)
         self.kappa = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
@@ -325,10 +325,13 @@ class InversePINN(nn.Module):
 
         # 7) normalize and forward
         x = (xb - x_mean_t) / x_std_t
-        u = self.forward(x)  # [N,6]
-        Px = u[:, 3]; Py = u[:, 4]; Pz = u[:, 5]
 
-        phi = torch.atan2(Py, Px)
+        # --- KRİTİK DEĞİŞİKLİK BURADA ---
+        preds = self.forward(x)  # [N, 2]
+        phi = preds[:, 0]        # Doğrudan Phi tahmini
+        # eta = preds[:, 1]      # Eta (PDE'de kullanılmıyor ama çıktı olarak var)
+
+        # Trigonometrik değerler (Stabilite için cos/sin üzerinden gidiyoruz)
         c = torch.cos(phi)  # [N]
         s = torch.sin(phi)  # [N]
 
@@ -340,30 +343,24 @@ class InversePINN(nn.Module):
         pt_ref = ptref_norm * x_std_t[self.ptref_index] + x_mean_t[self.ptref_index]
         pt_ref = torch.clamp(pt_ref.abs(), min=1e-2)
 
-        # 9) Omega hesabı ve Bz
-        # DÜZELTME: fixed_bz argüman olarak eklendi (varsayılan 3.81 Tesla)
+        # 9) Omega hesabı
         Bz = fixed_bz
-
-        # omega_R: Radyal mesafeye göre değişim hızı (dPhi / dR)
         omega_R = self.kappa * q * Bz / (pt_ref + eps)
 
-        # --- EKSİK PARÇA 2: Zincir Kuralı (Chain Rule) ---
-        # dPhi/dtau = (dPhi/dR) * (dR/dtau)
-        # dR/dtau = diff_R (yani outR - inR)
+        # Zincir Kuralı
         omega_tau = diff_R * omega_R
 
         # 10) total derivatives wrt tau
         dc_dtau = torch.autograd.grad(c, tau, grad_outputs=torch.ones_like(c),
-                                      create_graph=True, retain_graph=True)[0]  # [N]
+                                      create_graph=True, retain_graph=True)[0]
         ds_dtau = torch.autograd.grad(s, tau, grad_outputs=torch.ones_like(s),
-                                      create_graph=True, retain_graph=True)[0]  # [N]
+                                      create_graph=True, retain_graph=True)[0]
 
-        # 11) residuals (tau form)
-        # Artık omega_tau tanımlı olduğu için burası çalışır
+        # 11) residuals
         r1 = dc_dtau + s * omega_tau
         r2 = ds_dtau - c * omega_tau
 
-        res = torch.stack([r1, r2], dim=1)  # [N,2]
+        res = torch.stack([r1, r2], dim=1)
         return res, q
 
 # x_mean, x_std numpy -> torch tensor (device üzerinde)
@@ -430,7 +427,7 @@ Veri + PDE kaybı birlikte minimize edilir.
 """## 4. PINN Eğitimi
 Veri + PDE kaybı birlikte minimize edilir (train + val + adaptive λ_pde).
 """
-DEBUG_PDE = False
+DEBUG_PDE = True
 DEBUG_ONCE = {"done": False}
 
 pde_ema = None
@@ -470,28 +467,21 @@ lambda_pde = 1.0   # sende adaptive vardı; aşağıda onu daha doğru kullanaca
 eps = 1e-12
 
 
-def mom_to_phi_eta(Px, Py, Pz, eps=1e-12):
-    pt  = torch.sqrt(Px**2 + Py**2 + eps)
-    phi = torch.atan2(Py, Px)
-    eta = torch.asinh(Pz / (pt + eps))   # çok daha stabil
-    return phi, eta
-
 def pinn_loss(xb, yb):
     # ---- 1) model output ----
-    u_pred = model(xb)  # [N,6]
-    Px = u_pred[:, 3]
-    Py = u_pred[:, 4]
-    Pz = u_pred[:, 5]
+    preds = model(xb)   # [N, 2]
+    phi_pred = preds[:, 0]
+    eta_pred = preds[:, 1]
 
-    # ---- 2) phi/eta from momentum ----
-    phi_pred, eta_pred = mom_to_phi_eta(Px, Py, Pz, eps=eps)  # [N]
-
-    # ---- 3) normalize for data loss ----
+    # ---- 2) normalize for data loss ----
+    # (mom_to_phi_eta adımı kalktı, doğrudan normalize ediyoruz)
     phi_norm = (phi_pred - y_mean_t[0]) / y_std_t[0]
     eta_norm = (eta_pred - y_mean_t[1]) / y_std_t[1]
-    y_pred_norm = torch.stack([phi_norm, eta_norm], dim=1)  # [N,2]
 
-    # ---- 4) data loss ----
+    # ---- 3) data loss ----
+    # Gerçek değerler (yb zaten normalizeydi, denormalize edip karşılaştırıyoruz veya
+    # ikisini de normalize karşılaştırabiliriz. Kodun orijinalinde denormalize vardı, koruyalım)
+
     phi_true = yb[:,0] * y_std_t[0] + y_mean_t[0]
     eta_true = yb[:,1] * y_std_t[1] + y_mean_t[1]
 
@@ -500,92 +490,90 @@ def pinn_loss(xb, yb):
 
     loss_data = loss_phi + loss_eta
 
-
-    # ---- 5) geometry-consistency loss (unnormalized angles) ----
+    # ---- 4) geometry-consistency loss ----
     phi_dir, eta_dir = geometry_phi_eta_from_xnorm(xb, eps=eps)
     loss_geo = phi_angle_mse(phi_pred, phi_dir) + torch.mean((eta_pred - eta_dir)**2)
 
-        # ---- 6) PDE loss via collocation (TOTAL DERIVATIVE) ----
-    res, q = model.pde_residual_total(xb, eps=eps)  # res: [N,2], q: [N]
+    # ---- 5) PDE loss via collocation (SOFT GUIDE EDITION) ----
+    res, q = model.pde_residual_total(xb, fixed_bz=3.81, eps=eps)
 
-    # --- unnormalize needed inputs from *this batch* xb ---
+    # --- Fiziksel değerleri geri çağır ---
     xb_phys = xb * x_std_t + x_mean_t
+    pt_ref = xb_phys[:, ptref_index]                 # [N]
+    dR     = xb_phys[:, idx_outR] - xb_phys[:, idx_inR]  # [N]
 
-    pt_ref = xb_phys[:, ptref_index]                 # [N] physical
-    Bz     = 3.81                   # [N] physical
-    dR     = xb_phys[:, idx_outR] - xb_phys[:, idx_inR]  # [N] physical
+    # ====================================================
+    # 🧠 SMART SOFT GUIDE MECHANISM
+    # PDE'yi her yere dayatmak yerine, sadece fiziğin
+    # "net" olduğu bölgelere yumuşakça odaklıyoruz.
+    # ====================================================
 
-    # --- masks ---
-    mask_q  = (q.abs() >= 0.5)
-    mask_pt = (pt_ref > 0.0)   # sentinel/invalid pt_ref dışarı
-    mask = mask_q & mask_pt
-    mask_frac = mask.float().mean()
+    # 1. Yüksek pT Ağırlığı (Soft Sigmoid Ramp)
+    # pT < 2 GeV ise ağırlık 0'a yaklaşır.
+    # pT > 5 GeV ise ağırlık 1'e yaklaşır.
+    # (pt_ref - eşik) * jyrplik
+    w_pt = torch.sigmoid((pt_ref.abs() - 3.0) * 1.5)
 
-    # --- omega in R-domain, then tau-domain scaling ---
+    # 2. Büyük dR Ağırlığı (Tanh)
+    # Katmanlar arası mesafe (dR) çok kısaysa (pixel layers too close),
+    # türev gürültülü olur. Bunu sönümlüyoruz.
+    # dR büyüdükçe ağırlık 1'e gider.
+    w_dR = torch.tanh(dR.abs() / 2.0)
+
+    # 3. Güvenilir Yük (Charge Reliability)
+    # Yükün net olmadığı (-1 veya +1'den uzak) durumları eliyoruz.
+    # Burası keskin kalabilir veya sigmoid yapılabilir.
+    w_q = (q.abs() > 0.8).float()
+
+    # --- GLOBAL REHBER AĞIRLIĞI ---
+    # Hepsinin kesişimi: Hem pT yüksek, hem dR büyük, hem Q net olmalı.
+    w_guide = w_pt * w_dR * w_q  # [N] boyutunda, 0.0 ile 1.0 arası ağırlıklar
+
+    # --- Residual Scaling ---
+    # Omega ölçeklemesini yine yapıyoruz (stabilite için şart)
     pt_ref_c = torch.clamp(pt_ref.abs(), min=1e-2)
-    omega_R  = model.kappa * q * Bz / (pt_ref_c + eps)   # [N]
-    omega_tau = dR * omega_R                              # [N]
+    Bz = 3.81
+    omega_R_raw = model.kappa * q * Bz / (pt_ref_c + eps)
+    omega_tau_raw = dR * omega_R_raw
+    omega_scale = torch.sqrt((omega_tau_raw**2).mean()).detach() + 1e-3
 
-    # --- scale residual by typical omega_tau magnitude ---
-    omega_scale = torch.sqrt((omega_tau**2).mean()).detach() + 1e-3
     res_scaled = res / omega_scale
 
-    # --- masked PDE loss ---
-    if mask.any():
-        loss_pde = torch.mean(res_scaled[mask] ** 2)
-    else:
-        loss_pde = torch.tensor(0.0, device=xb.device)
+    # --- Weighted PDE Loss ---
+    # (Hata)^2 * (Güven Ağırlığı)
+    loss_per_sample = (res_scaled ** 2).mean(dim=1) # [N] (r1 ve r2 ortalaması)
+
+    # Ağırlıklı Ortalama:
+    # Sadece güvenilir bölgelerin hatasını minimize et, çöp bölgeleri görmezden gel.
+    weighted_loss = loss_per_sample * w_guide
+
+    # Toplam ağırlığa bölerek normalize et (Sıfıra bölme korumalı)
+    loss_pde = weighted_loss.sum() / (w_guide.sum() + 1e-6)
+
+    # Rehberin ne kadar aktif olduğunu görmek için (Opsiyonel print)
+    # if epoch % 10 == 0 and batch_idx == 0:
+    #    print(f"  -> Guide Active Ratio: {w_guide.mean().item():.2f}")
 
 
-    # ---------------- DEBUG PRINTS (once) ----------------
+    # ---------------- DEBUG PRINTS (Soft Guide Version) ----------------
     if DEBUG_PDE and (not DEBUG_ONCE["done"]):
         with torch.no_grad():
-            print("\n=== DEBUG PDE (one batch) ===")
-            print("mask_frac:", float(mask_frac.item()),
-                  "| N_mask:", int(mask.sum().item()),
-                  "/", int(mask.numel()))
-            print("mask_q only frac:", float(mask_q.float().mean().item()),
-                  "| mask_pt only frac:", float(mask_pt.float().mean().item()))
-
-            qv = q.detach().cpu()
-            print("q unique approx:", {v: int((qv==v).sum()) for v in [-1.0, 0.0, 1.0]})
+            print("\n=== DEBUG PDE (Soft Guide) ===")
+            print(f"w_guide (Total) mean: {w_guide.mean().item():.4f}")
+            print(f"w_pt (pT weight) mean: {w_pt.mean().item():.4f}")
+            print(f"w_dR (dR weight) mean: {w_dR.mean().item():.4f}")
 
             print("pt_ref min/mean/max:",
                   float(pt_ref.min().item()),
                   float(pt_ref.mean().item()),
                   float(pt_ref.max().item()))
 
-            print("Bz (bSZ) min/mean/max:",
-                  float(Bz.min().item()),
-                  float(Bz.mean().item()),
-                  float(Bz.max().item()))
+            print("omega_scale:", float(omega_scale.item()))
+            print("loss_per_sample mean:", float(loss_per_sample.mean().item()))
+            print("Final weighted loss_pde:", float(loss_pde.item()))
 
-            print("omega_R abs mean/max:",
-                  float(omega_R.abs().mean().item()),
-                  float(omega_R.abs().max().item()))
-            print("omega_tau abs mean/max:",
-                  float(omega_tau.abs().mean().item()),
-                  float(omega_tau.abs().max().item()))
-
-
-            if mask.any():
-                rm = res[mask]
-                rsm = res_scaled[mask]
-                print("res abs mean/max (masked raw):",
-                      float(rm.abs().mean().item()),
-                      float(rm.abs().max().item()))
-                print("res abs mean/max (masked scaled):",
-                      float(rsm.abs().mean().item()),
-                      float(rsm.abs().max().item()))
-
-            print("loss_pde (scaled, masked):", float(loss_pde.item()))
-            print("kappa:", float(model.kappa.detach().item()))
         DEBUG_ONCE["done"] = True
-    # ----------------------------------------------------
-
-
-
-
+    # -------------------------------------------------------------------
 
     # ---- 6b) PDE loss normalization (EMA) ----
     global pde_ema
@@ -594,8 +582,6 @@ def pinn_loss(xb, yb):
         pde_ema = v if pde_ema is None else 0.99 * pde_ema + 0.01 * v
 
     loss_pde_norm = loss_pde / (pde_ema + 1e-8)
-
-
 
 
     # ---- 7) total ----
@@ -613,11 +599,6 @@ def pinn_loss(xb, yb):
         loss_geo.detach().item(),
         loss_pde_norm.detach().item(),   # <-- artık log’da "pde" total’daki ölçekle aynı
     )
-
-
-
-
-
 
 
 
@@ -681,11 +662,9 @@ for epoch in range(1, NUM_EPOCHS_PINN + 1):
     if epoch % SNAP_EVERY == 0 or epoch == 1:
         model.eval()
         with torch.no_grad():
-            u_anim = model(X_anim_tensor)    # [n_anim, 6]
-            Px = u_anim[:, 3]
-            Py = u_anim[:, 4]
-            Pz = u_anim[:, 5]
-            phi_anim, eta_anim = mom_to_phi_eta(Px, Py, Pz)  # [n_anim]
+            preds_anim = model(X_anim_tensor)  # [n_anim, 2]
+            phi_anim = preds_anim[:, 0]
+            eta_anim = preds_anim[:, 1]  # [n_anim]
 
             # denormalize etmeye gerek yok, phi/eta zaten gerçek uzayda
             y_pred_anim = torch.stack([phi_anim, eta_anim], dim=1).cpu().numpy()
@@ -810,15 +789,26 @@ check_feature_scales(X_tensor, feature_cols)
 
 @torch.no_grad()
 def check_pde_inputs(model, xb):
+    # Model artık [N, 2] veriyor: (Phi_norm, Eta_norm)
     u = model(xb)
-    Px, Py, Pz = u[:,3], u[:,4], u[:,5]
-    pt = torch.sqrt(Px**2 + Py**2 + 1e-12)
+    phi_norm = u[:, 0]
+    eta_norm = u[:, 1]
 
-    print("=== PDE INPUT CHECK ===")
-    print("Px:", Px.min().item(), Px.max().item())
-    print("Py:", Py.min().item(), Py.max().item())
-    print("Pz:", Pz.min().item(), Pz.max().item())
-    print("pT:", pt.min().item(), pt.mean().item(), pt.max().item())
+    # Denormalize (görmek için)
+    phi_phys = phi_norm * y_std_t[0] + y_mean_t[0]
+    eta_phys = eta_norm * y_std_t[1] + y_mean_t[1]
+
+    print("=== MODEL OUTPUT CHECK (Phi/Eta) ===")
+    print(f"Phi (phys): min={phi_phys.min().item():.3f}, max={phi_phys.max().item():.3f}, mean={phi_phys.mean().item():.3f}")
+    print(f"Eta (phys): min={eta_phys.min().item():.3f}, max={eta_phys.max().item():.3f}, mean={eta_phys.mean().item():.3f}")
+
+    # Ayrıca input pT'yi de kontrol edelim (PDE için önemli)
+    # xb unnormalize edilecek
+    xb_phys = xb * x_std_t + x_mean_t
+    pt_ref = xb_phys[:, ptref_index]
+
+    print("\n=== PDE INPUT CONSTANTS CHECK ===")
+    print(f"Input pT: min={pt_ref.min().item():.3f}, max={pt_ref.max().item():.3f}, mean={pt_ref.mean().item():.3f}")
 
 # train başlamadan önce:
 check_pde_inputs(model, X_train[:2048])
@@ -1104,11 +1094,11 @@ PINN ve NN için MSE, MAE, R² karşılaştırması.
 
 model.eval()
 with torch.no_grad():
-    u_test = model(X_test)             # [N_test, 6]
-    Px = u_test[:, 3]
-    Py = u_test[:, 4]
-    Pz = u_test[:, 5]
-    phi_test, eta_test = mom_to_phi_eta(Px, Py, Pz)
+    preds_pinn = model(X_test)         # [N_test, 2]
+    phi_test = preds_pinn[:, 0]
+    eta_test = preds_pinn[:, 1]
+
+    # Numpy'a çevir
     y_pred_pinn = torch.stack([phi_test, eta_test], dim=1).cpu().numpy()
 
 
