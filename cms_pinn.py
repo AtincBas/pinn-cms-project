@@ -223,7 +223,7 @@ class InversePINN(nn.Module):
         self.net = FCNN(in_dim, out_dim=2)
 
         # Ölçek sabiti (birim/param belirsizliği)
-        self.kappa = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.kappa = nn.Parameter(torch.tensor(0.003, dtype=torch.float32))
 
     def forward(self, x):
         return self.net(x)
@@ -462,8 +462,8 @@ history_pinn = {
     "lambda_geo": [],
 }
 
-lambda_geo = 1.0   # başlangıç
-lambda_pde = 1.0   # sende adaptive vardı; aşağıda onu daha doğru kullanacağız
+lambda_geo = 0.0   # başlangıç
+lambda_pde = 0.5   # sende adaptive vardı; aşağıda onu daha doğru kullanacağız
 eps = 1e-12
 
 
@@ -512,7 +512,7 @@ def pinn_loss(xb, yb):
     # pT < 2 GeV ise ağırlık 0'a yaklaşır.
     # pT > 5 GeV ise ağırlık 1'e yaklaşır.
     # (pt_ref - eşik) * jyrplik
-    w_pt = torch.sigmoid((pt_ref.abs() - 3.0) * 1.5)
+    w_pt = torch.sigmoid((pt_ref.abs() - 0.6) * 2.0)
 
     # 2. Büyük dR Ağırlığı (Tanh)
     # Katmanlar arası mesafe (dR) çok kısaysa (pixel layers too close),
@@ -687,11 +687,13 @@ for epoch in range(1, NUM_EPOCHS_PINN + 1):
 
 
     if epoch % 5 == 0 or epoch == 1:
+        current_kappa = model.kappa.item() # Kappa'nın güncel değeri
         print(
             f"Epoch {epoch:03d} | "
-            f"Train L={avg_train_loss:.3e} (data={avg_train_data:.3e}, geo={avg_train_geo:.3e}, pde={avg_train_pde:.3e}) | "
-            f"Val L={avg_val_loss:.3e} (data={avg_val_data:.3e}, geo={avg_val_geo:.3e}, pde={avg_val_pde:.3e}) | "
-            f"lambda_geo={lambda_geo:.2e} | lambda_pde={lambda_pde:.2e}"
+            f"Train L={avg_train_loss:.3e} (data={avg_train_data:.3e}, pde={avg_train_pde:.3e}) | "
+            f"Val L={avg_val_loss:.3e} | "
+            f"κ (kappa)={current_kappa:.5f} | " # Kappa'yı burada görüyoruz
+            f"λ_pde={lambda_pde:.2e}"
         )
 
 """## 5. Pure NN Eğitimi
