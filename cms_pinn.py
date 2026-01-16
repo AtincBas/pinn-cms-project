@@ -212,8 +212,11 @@ import torch.nn.functional as F
 import math
 import torch
 
-def wrap_torch(dphi):
-    return (dphi + math.pi) % (2*math.pi) - math.pi
+def angle_diff(a, b):
+    # smooth, differentiable
+    d = a - b
+    return torch.atan2(torch.sin(d), torch.cos(d))
+
 
 class InversePINN(nn.Module):
     def __init__(self, in_dim, charge_index, ptref_index, y_mean_t, y_std_t):
@@ -280,7 +283,7 @@ class InversePINN(nn.Module):
         preds_norm = self.forward(x)  # [N,2]
         phi_norm = preds_norm[:, 0]
 
-        # ✅ PDE trig MUST use physical phi
+        #PDE trig MUST use physical phi
         phi = phi_norm * self.y_std[0] + self.y_mean[0]
 
         c = torch.cos(phi)
@@ -294,7 +297,9 @@ class InversePINN(nn.Module):
         pt_safe = torch.where(valid_pt, torch.clamp(pt_raw, min=1e-2), torch.ones_like(pt_raw))
 
         omega_R = self.kappa * q * fixed_bz / (pt_safe + eps)
-        omega_tau = diff_R * omega_R
+        sxy = torch.sqrt(dx*dx + dy*dy + eps)
+        omega_tau = sxy * omega_R
+
 
         # total derivatives wrt tau
         dc_dtau = torch.autograd.grad(c, tau, grad_outputs=torch.ones_like(c),
@@ -365,10 +370,14 @@ ptref_index   = feature_cols.index("inTpPt")   # <-- A
 
 model = InversePINN(in_dim, charge_index, ptref_index, y_mean_t, y_std_t).to(device)
 
-optimizer = optim.Adam([
-    {"params": model.net.parameters(), "lr": 1e-3},
-    {"params": [model.kappa_raw],      "lr": 1e-4},   # kappa daha küçük LR
-])
+# kappa şimdilik DONUK
+model.kappa_raw.requires_grad = False
+
+optimizer = optim.Adam(
+    model.net.parameters(),
+    lr=1e-3
+)
+
 
 mse_loss  = nn.MSELoss()
 
@@ -385,41 +394,42 @@ history_pinn = {
     "lambda_pde": [],
 }
 
-lambda_pde = 0.2   # sende adaptive vardı; aşağıda onu daha doğru kullanacağız
+lambda_pde = 0.02   # sende adaptive vardı; aşağıda onu daha doğru kullanacağız
 eps = 1e-12
 warmup_epochs = 10
 ramp_epochs   = 20
 
-def pinn_loss(xb, yb, lambda_pde_eff, eps=1e-12):
-    # model output (normalized)
+
+pde_ema = None  # global
+
+def pinn_loss(xb, yb, lambda_pde_eff, eps=1e-12, update_ema=True, wsum_thresh=10.0):
     preds = model(xb)
     phi_n = preds[:, 0]
     eta_n = preds[:, 1]
 
-    # ---- Data loss ----
-    # denorm to physical
+    # ---- Data loss (physical) ----
     phi_pred = phi_n * y_std_t[0] + y_mean_t[0]
     eta_pred = eta_n * y_std_t[1] + y_mean_t[1]
 
     phi_true = yb[:, 0] * y_std_t[0] + y_mean_t[0]
     eta_true = yb[:, 1] * y_std_t[1] + y_mean_t[1]
 
-    dphi = wrap_torch(phi_pred - phi_true)
-    loss_phi = torch.mean(1.0 - torch.cos(dphi))      # circular
-    loss_eta = torch.mean((eta_pred - eta_true)**2)   # MSE physical
+    dphi = angle_diff(phi_pred, phi_true)
+    loss_phi = torch.mean(dphi**2)                  # <-- patched
+    loss_eta = torch.mean((eta_pred - eta_true)**2)
     loss_data = loss_eta + loss_phi
 
     # ---- PDE loss ----
     res, q, valid_pt, pt_raw, dR = model.pde_residual_total(xb, fixed_bz=3.81, eps=eps)
 
-    # soft-guide (invalid pt -> 0)
-    # thresholdları sonra tune ederiz; şimdilik valid_pt şart
-    w_pt = valid_pt.float() * torch.sigmoid((pt_raw - 2.0) / 0.7)  # daha mantıklı eşik
+    # weights
+    # (şimdilik pt eşiğini çok agresif yapma; yoksa wsum hep düşer)
+    w_pt = valid_pt.float() * torch.sigmoid((pt_raw - 0.5) / 0.5)
     w_dR = torch.tanh(dR.abs() / 2.0)
     w_q  = (q.abs() > 0.8).float()
     w = w_pt * w_dR * w_q
 
-    # omega scale (sadece valid_pt üzerinde)
+    # omega scale
     pt_safe = torch.where(valid_pt, torch.clamp(pt_raw, min=1e-2), torch.ones_like(pt_raw))
     omega_tau = dR * (model.kappa * q * 3.81 / (pt_safe + eps))
     omega_tau = omega_tau * valid_pt.float()
@@ -428,25 +438,43 @@ def pinn_loss(xb, yb, lambda_pde_eff, eps=1e-12):
     res_scaled = res / omega_scale
     loss_per_sample = (res_scaled**2).mean(dim=1)
 
-    # ağırlıklı ortalama; eğer batch'te w çok küçükse PDE'yi zorlama
     wsum = w.sum()
-    if wsum < 10.0:  # batch'te yeterince "geçerli" örnek yok
-        loss_pde = loss_per_sample.mean()
+
+    # CRITICAL PATCH: if not enough valid samples, SKIP PDE (set 0)
+    if wsum < wsum_thresh:
+        loss_pde = torch.zeros((), device=xb.device, dtype=xb.dtype)
+        pde_skipped = True
     else:
         loss_pde = (loss_per_sample * w).sum() / (wsum + 1e-6)
+        pde_skipped = False
 
-    # ---- EMA normalization ----
+    # ---- EMA normalization (train only) ----
     global pde_ema
-    with torch.no_grad():
-        v = loss_pde.detach()
-        pde_ema = v if pde_ema is None else 0.99 * pde_ema + 0.01 * v
+    if update_ema:
+        with torch.no_grad():
+            v = loss_pde.detach()
+            if pde_ema is None:
+                pde_ema = v
+            else:
+                pde_ema = 0.99 * pde_ema + 0.01 * v
 
-    loss_pde_norm = loss_pde / (pde_ema + 1e-8)
+    denom = (pde_ema if (pde_ema is not None) else (loss_pde.detach() + 1e-8))
+    loss_pde_norm = loss_pde / (denom + 1e-8)
 
-    # ---- total ----
+    # ---- Total ----
     loss_total = loss_data + lambda_pde_eff * loss_pde_norm
 
-    return loss_total, loss_data.detach().item(), loss_pde_norm.detach().item()
+    # debug stats
+    frac_valid = valid_pt.float().mean().detach()
+    return (
+        loss_total,
+        loss_data.detach().item(),
+        loss_pde_norm.detach().item(),
+        float(wsum.detach().item()),
+        bool(pde_skipped),
+        float(frac_valid.item()),
+    )
+
 
 
 
@@ -465,21 +493,36 @@ for epoch in range(1, NUM_EPOCHS_PINN + 1):
     model.train()
     total_loss = total_data = total_pde = 0.0
 
+    # epoch başına debug sayaçları reset
+    skip_count = 0
+    batch_count = 0
+    wsum_acc = 0.0
+    frac_valid_acc = 0.0
+
     # lambda schedule
     if epoch <= warmup_epochs:
         lambda_eff = 0.0
-        model.kappa_raw.requires_grad = False
     elif epoch <= warmup_epochs + ramp_epochs:
-        t = (epoch - warmup_epochs) / ramp_epochs  # 0..1
+        t = (epoch - warmup_epochs) / ramp_epochs
         lambda_eff = t * lambda_pde
-        model.kappa_raw.requires_grad = True
     else:
         lambda_eff = lambda_pde
-        model.kappa_raw.requires_grad = True
 
+    # ---------- TRAIN ----------
     for xb, yb in train_loader_pinn:
         optimizer.zero_grad()
-        loss, ldata, lpde = pinn_loss(xb, yb, lambda_eff)
+
+        loss, ldata, lpde, wsum, skipped, frac_valid = pinn_loss(
+            xb, yb, lambda_eff, update_ema=True
+        )
+
+        # debug sayaç güncelle (batch içinde!)
+        batch_count += 1
+        wsum_acc += wsum
+        frac_valid_acc += frac_valid
+        if skipped:
+            skip_count += 1
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -493,18 +536,13 @@ for epoch in range(1, NUM_EPOCHS_PINN + 1):
     avg_train_data = total_data / len(train_dataset_pinn)
     avg_train_pde  = total_pde  / len(train_dataset_pinn)
 
-    # adaptive lambda update (sadece ramp bittikten sonra)
-    if epoch > warmup_epochs + ramp_epochs:
-        with torch.no_grad():
-            target = avg_train_data / (avg_train_pde + 1e-8)
-            lambda_pde = 0.95 * lambda_pde + 0.05 * float(target)
-            lambda_pde = float(np.clip(lambda_pde, 0.0, 2.0))  # ✅ daha sıkı cap
-
-    # VALIDATION
+    # ---------- VALIDATION ----------
     model.eval()
     val_total = val_data = val_pde = 0.0
     for xb, yb in val_loader_pinn:
-        loss, ldata, lpde = pinn_loss(xb, yb, lambda_eff)
+        loss, ldata, lpde, _, _, _ = pinn_loss(
+            xb, yb, lambda_eff, update_ema=False
+        )
         bs = xb.size(0)
         val_total += loss.item() * bs
         val_data  += ldata * bs
@@ -540,7 +578,10 @@ for epoch in range(1, NUM_EPOCHS_PINN + 1):
             f"Train L={avg_train_loss:.3e} (data={avg_train_data:.3e}, pde={avg_train_pde:.3e}) | "
             f"Val L={avg_val_loss:.3e} | "
             f"kappa={model.kappa.item():.6f} | "
-            f"lambda_pde={lambda_pde:.3f} | lambda_eff={lambda_eff:.3f}"
+            f"lambda_pde={lambda_pde:.3f} | lambda_eff={lambda_eff:.3f} | "
+            f"skip={skip_count}/{batch_count} ({skip_count/max(1,batch_count):.2%}) | "
+            f"wsum_avg={wsum_acc/max(1,batch_count):.2f} | "
+            f"valid_pt_avg={frac_valid_acc/max(1,batch_count):.2f}"
         )
 
 """## 5. Pure NN Eğitimi
