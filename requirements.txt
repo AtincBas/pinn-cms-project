@@ -1,0 +1,15 @@
+# Core ML / training (GPU environment — Google Colab recommended)
+torch>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.2.0
+
+# Data I/O
+pandas>=2.0.0
+pyarrow>=12.0.0       # parquet read/write
+tables>=3.8.0         # PyTables — for reading raw CERN HDF5 files
+
+# Visualization
+matplotlib>=3.7.0
+
+# Reproducibility
+# Python 3.10+ recommended (tested on 3.10 / Colab default)
