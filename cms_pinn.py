@@ -77,6 +77,8 @@ def load_data(max_samples=None):
 
     pd.read_hdf fails on Python 3.10+ with the Pandas fixed-format store used
     in this dataset, so we read the two data blocks directly with PyTables.
+
+    When max_samples is set, only that many rows are read from disk (fast path).
     """
     if not os.path.exists(HDF_PATH):
         raise FileNotFoundError(
@@ -91,22 +93,34 @@ def load_data(max_samples=None):
     with tables.open_file(HDF_PATH, mode="r") as h5:
         root = h5.root.data
         items0 = [c.decode() for c in root.block0_items[:]]
-        vals0  = root.block0_values[:]
         items1 = [c.decode() for c in root.block1_items[:]]
-        vals1  = root.block1_values[:]
 
-    df0 = pd.DataFrame(vals0, columns=items0)
-    df1 = pd.DataFrame(vals1, columns=items1)
-    df  = pd.concat([df0, df1], axis=1)
+        # Determine which columns are needed and their block indices
+        need0 = [c for c in NEEDED_COLS if c in items0]
+        need1 = [c for c in NEEDED_COLS if c in items1]
+        idx0  = [items0.index(c) for c in need0]
+        idx1  = [items1.index(c) for c in need1]
 
-    df = df[[c for c in NEEDED_COLS if c in df.columns]]
+        # Read only the rows we need — avoids loading all 5.38M rows when
+        # max_samples is small.
+        row_slice = slice(None) if max_samples is None else slice(0, max_samples)
+
+        # block*_values shape is (N_rows, N_cols)
+        vals0 = root.block0_values[row_slice][:, idx0] if idx0 else np.empty((0, 0))
+        vals1 = root.block1_values[row_slice][:, idx1] if idx1 else np.empty((0, 0))
+
+    frames = []
+    if idx0:
+        frames.append(pd.DataFrame(vals0, columns=need0))
+    if idx1:
+        frames.append(pd.DataFrame(vals1, columns=need1))
+    df = pd.concat(frames, axis=1) if frames else pd.DataFrame()
+
     missing = [c for c in NEEDED_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"Missing columns in HDF5: {missing}")
 
-    if max_samples is not None:
-        df = df.iloc[:max_samples].copy()
-
+    df = df[NEEDED_COLS]
     print(f"Loaded {len(df):,} rows × {len(df.columns)} columns.")
     return df
 
@@ -186,49 +200,54 @@ class InversePINN(nn.Module):
         pt_raw     : [N]
         delta_R    : [N]
         """
-        xb = xb_norm * self.x_std + self.x_mean   # un-normalize to physical
+        # enable_grad ensures autograd works even when called inside torch.no_grad()
+        with torch.enable_grad():
+            xb = xb_norm * self.x_std + self.x_mean   # un-normalize to physical
 
-        N = xb.size(0)
-        tau = torch.rand(N, device=xb.device, dtype=xb.dtype, requires_grad=True)
+            N = xb.size(0)
+            tau = torch.rand(N, device=xb.device, dtype=xb.dtype, requires_grad=True)
 
-        inX  = xb[:, self.iX];  inY  = xb[:, self.iY];  inZ  = xb[:, self.iZ]
-        outX = xb[:, self.oX];  outY = xb[:, self.oY];  outZ = xb[:, self.oZ]
-        inR  = xb[:, self.iR];  outR0 = xb[:, self.oR]
+            inX  = xb[:, self.iX];  inY  = xb[:, self.iY];  inZ  = xb[:, self.iZ]
+            outX = xb[:, self.oX];  outY = xb[:, self.oY];  outZ = xb[:, self.oZ]
+            inR  = xb[:, self.iR];  outR0 = xb[:, self.oR]
 
-        dx = outX - inX;  dy = outY - inY;  dz = outZ - inZ
-        dR = outR0 - inR
+            dx = outX - inX;  dy = outY - inY;  dz = outZ - inZ
+            dR = outR0 - inR
 
-        # Interpolate hit positions and radius along segment
-        xi = inX + tau * dx;  yi = inY + tau * dy;  zi = inZ + tau * dz
-        Ri = inR + tau * dR
+            # Interpolate hit positions and radius along segment
+            xi = inX + tau * dx;  yi = inY + tau * dy;  zi = inZ + tau * dz
+            Ri = inR + tau * dR
 
-        # Rebuild physical feature vector at collocation point
-        xc = xb.clone()
-        xc[:, self.oX] = xi;  xc[:, self.oY] = yi
-        xc[:, self.oZ] = zi;  xc[:, self.oR] = Ri
+            # Build collocation feature vector without in-place ops so autograd
+            # correctly tracks τ through the network forward pass.
+            n_feat = xb.shape[1]
+            col_map = {self.oX: xi, self.oY: yi, self.oZ: zi, self.oR: Ri}
+            cols = [col_map[i].unsqueeze(1) if i in col_map
+                    else xb[:, i:i+1].detach() for i in range(n_feat)]
+            xc = torch.cat(cols, dim=1)
 
-        # Normalize and forward
-        xc_norm = (xc - self.x_mean) / self.x_std
-        phi_norm = self.net(xc_norm)[:, 0]
-        phi = phi_norm * self.y_std[0] + self.y_mean[0]
+            # Normalize and forward
+            xc_norm = (xc - self.x_mean) / self.x_std
+            phi_norm = self.net(xc_norm)[:, 0]
+            phi = phi_norm * self.y_std[0] + self.y_mean[0]
 
-        c = torch.cos(phi);  s = torch.sin(phi)
+            c = torch.cos(phi);  s = torch.sin(phi)
 
-        q      = xb[:, self.iq]
-        pt_raw = xb[:, self.ipt]
-        valid_pt = pt_raw > 0.0
-        pt_safe  = torch.where(valid_pt, pt_raw.clamp(min=1e-2), torch.ones_like(pt_raw))
+            q      = xb[:, self.iq]
+            pt_raw = xb[:, self.ipt]
+            valid_pt = pt_raw > 0.0
+            pt_safe  = torch.where(valid_pt, pt_raw.clamp(min=1e-2), torch.ones_like(pt_raw))
 
-        sxy       = torch.sqrt(dx**2 + dy**2 + eps)
-        omega_tau = sxy * (self.kappa * q * self.FIXED_BZ / (pt_safe + eps))
+            sxy       = torch.sqrt(dx**2 + dy**2 + eps)
+            omega_tau = sxy * (self.kappa * q * self.FIXED_BZ / (pt_safe + eps))
 
-        dc = torch.autograd.grad(c, tau, grad_outputs=torch.ones_like(c),
-                                 create_graph=True, retain_graph=True)[0]
-        ds = torch.autograd.grad(s, tau, grad_outputs=torch.ones_like(s),
-                                 create_graph=True, retain_graph=True)[0]
+            dc = torch.autograd.grad(c, tau, grad_outputs=torch.ones_like(c),
+                                     create_graph=True, retain_graph=True)[0]
+            ds = torch.autograd.grad(s, tau, grad_outputs=torch.ones_like(s),
+                                     create_graph=True, retain_graph=True)[0]
 
-        r1 = dc + s * omega_tau
-        r2 = ds - c * omega_tau
+            r1 = dc + s * omega_tau
+            r2 = ds - c * omega_tau
 
         return torch.stack([r1, r2], dim=1), q, valid_pt, pt_raw, dR
 
@@ -378,17 +397,20 @@ def train_pinn(model, X_train, y_train, X_val, y_val, args, device):
         N_tr = len(loader_tr.dataset)
         avg  = {k: v / N_tr for k, v in acc.items()}
 
-        # --- val ---
+        # --- val (data loss only — skip expensive PDE autograd) ---
         model.eval()
         vl = vd = vp = 0.
         with torch.no_grad():
             for xb, yb in loader_va:
-                total_v, ld_v, lp_v, *_ = pinn_loss_fn(
-                    model, xb, yb, leff, pde_ema, update_ema=False
-                )
+                preds    = model(xb)
+                phi_pred = preds[:, 0] * model.y_std[0] + model.y_mean[0]
+                eta_pred = preds[:, 1] * model.y_std[1] + model.y_mean[1]
+                phi_true = yb[:, 0] * model.y_std[0] + model.y_mean[0]
+                eta_true = yb[:, 1] * model.y_std[1] + model.y_mean[1]
+                ld_v = (torch.mean(angle_diff(phi_pred, phi_true) ** 2)
+                        + torch.mean((eta_pred - eta_true) ** 2)).item()
                 bs = xb.size(0)
-                vl += total_v.item() * bs
-                vd += ld_v * bs;  vp += lp_v * bs
+                vl += ld_v * bs;  vd += ld_v * bs
         N_va = len(loader_va.dataset)
 
         hist["epoch"].append(ep)
@@ -482,7 +504,12 @@ def print_metrics(y_true, y_pred, name):
 
 def main():
     args   = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Device: {device}")
 
     torch.manual_seed(args.seed)
