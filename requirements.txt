@@ -10,6 +10,7 @@ tables>=3.8.0         # PyTables — for reading raw CERN HDF5 files
 
 # Visualization
 matplotlib>=3.7.0
+scipy>=1.10.0          # Gaussian fit in error distribution plots
 
 # Reproducibility
 # Python 3.10+ recommended (tested on 3.10 / Colab default)
