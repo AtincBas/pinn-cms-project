@@ -47,6 +47,9 @@ def parse_args():
     p.add_argument("--lr",           type=float, default=1e-3)
     p.add_argument("--lambda_pde",   type=float, default=0.02)
     p.add_argument("--batch_size",   type=int,   default=512)
+    p.add_argument("--pde_frac",     type=float, default=1.0,
+                   help="Fraction of each batch used for PDE residual (0.25 = 4x faster, "
+                        "use 1.0 for paper-exact reproducibility)")
     p.add_argument("--output_dir",   default=".",
                    help="Directory for df_test.parquet and history CSVs")
     p.add_argument("--seed",         type=int,   default=42)
@@ -244,7 +247,7 @@ class InversePINN(nn.Module):
             dc = torch.autograd.grad(c, tau, grad_outputs=torch.ones_like(c),
                                      create_graph=True, retain_graph=True)[0]
             ds = torch.autograd.grad(s, tau, grad_outputs=torch.ones_like(s),
-                                     create_graph=True, retain_graph=True)[0]
+                                     create_graph=True, retain_graph=False)[0]
 
             r1 = dc + s * omega_tau
             r2 = ds - c * omega_tau
@@ -263,9 +266,14 @@ def angle_diff(a, b):
 
 def pinn_loss_fn(model, xb, yb, lambda_pde_eff,
                  pde_ema, eps=1e-12,
-                 update_ema=True, wsum_thresh=10.0):
+                 update_ema=True, wsum_thresh=10.0,
+                 pde_frac=1.0):
     """
     Compute PINN total loss = L_data + λ_pde * L̃_pde.
+
+    pde_frac: fraction of the batch used for PDE residual. Values < 1.0
+    trade a noisier physics gradient for proportionally faster epochs.
+    Use 1.0 for paper-exact reproducibility.
 
     Returns
     -------
@@ -283,7 +291,25 @@ def pinn_loss_fn(model, xb, yb, lambda_pde_eff,
     loss_data = loss_eta + loss_phi
 
     # --- PDE residual ---
-    res, q, valid_pt, pt_raw, dR = model.pde_residual(xb, eps=eps)
+    # When lambda_pde_eff == 0 (warmup), skip expensive autograd entirely.
+    if lambda_pde_eff == 0.0:
+        zero = torch.zeros((), device=xb.device, dtype=xb.dtype)
+        if update_ema:
+            pass  # leave pde_ema unchanged during warmup
+        return (loss_data, loss_data.detach().item(),
+                0.0, 0.0, float(pde_ema.item()) if pde_ema is not None else 0.0,
+                0.0, True, 0.0, pde_ema)
+
+    # Subsample batch for PDE when pde_frac < 1.0 — reduces autograd cost
+    # proportionally while keeping the data loss on the full batch.
+    if pde_frac < 1.0:
+        n_pde = max(16, int(xb.size(0) * pde_frac))
+        idx   = torch.randperm(xb.size(0), device=xb.device)[:n_pde]
+        xb_pde = xb[idx]
+    else:
+        xb_pde = xb
+
+    res, q, valid_pt, pt_raw, dR = model.pde_residual(xb_pde, eps=eps)
 
     w_pt = valid_pt.float() * torch.sigmoid((pt_raw - 0.5) / 0.5)
     w_dR = torch.tanh(dR.abs() / 2.0)
@@ -380,7 +406,8 @@ def train_pinn(model, X_train, y_train, X_val, y_val, args, device):
             opt.zero_grad()
             (total, ld, lp, lp_raw, ema_val,
              wsum, sk, fv, pde_ema) = pinn_loss_fn(
-                model, xb, yb, leff, pde_ema, update_ema=True
+                model, xb, yb, leff, pde_ema,
+                update_ema=True, pde_frac=args.pde_frac
             )
             total.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
