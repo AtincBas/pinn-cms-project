@@ -247,7 +247,7 @@ class InversePINN(nn.Module):
             dc = torch.autograd.grad(c, tau, grad_outputs=torch.ones_like(c),
                                      create_graph=True, retain_graph=True)[0]
             ds = torch.autograd.grad(s, tau, grad_outputs=torch.ones_like(s),
-                                     create_graph=True, retain_graph=False)[0]
+                                     create_graph=True, retain_graph=True)[0]
 
             r1 = dc + s * omega_tau
             r2 = ds - c * omega_tau
